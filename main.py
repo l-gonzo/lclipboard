@@ -1,46 +1,66 @@
 import sys
 import subprocess
+import threading
+import time
+import os
+import hashlib
+
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout,
     QListWidget, QLineEdit, QListWidgetItem
 )
-from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QCursor
-from PyQt6.QtGui import QPixmap
-from PyQt6.QtGui import QIcon  
-from PyQt6.QtCore import QByteArray
-from PyQt6.QtCore import QTimer
+from PyQt6.QtCore import Qt, QByteArray, QTimer
+from PyQt6.QtGui import QCursor, QPixmap, QIcon
+
 from pynput import keyboard
 from pynput.keyboard import Controller, Key
-import hashlib
-import threading
-import time
-import os
 
+
+# =========================
+# CONFIGURACIÓN GLOBAL
+# =========================
 SESSION_TYPE = os.environ.get("XDG_SESSION_TYPE", "").lower()
 IS_WAYLAND = SESSION_TYPE == "wayland"
 
-def get_hash(data):
-    if data["type"] == "text":
-        return hashlib.md5(data["data"].encode()).hexdigest()
-    else:
-        return hashlib.md5(data["data"]).hexdigest()
-    
-# 
-# CONTROL
-# 
-kb = Controller()
+MAX_ITEMS = 100
+POLL_INTERVAL = 0.5
+
+
+# =========================
+# ESTADO COMPARTIDO
+# =========================
+history = []
+last_hash = ""
 lock = threading.Lock()
 
-MAX_ITEMS = 100
-history = []
-last = ""
+kb = Controller()
 
-# 
+
+# =========================
+# UTILIDADES
+# =========================
+def compute_hash(data: dict) -> str:
+    """
+    Genera un hash único para detectar cambios en el clipboard.
+    """
+    raw = data["data"]
+    if data["type"] == "text":
+        raw = raw.encode()
+
+    return hashlib.md5(raw).hexdigest()
+
+
+# =========================
 # CLIPBOARD
-# 
-def get_clipboard():
-    # Intentar imagen primero
+# =========================
+def get_clipboard() -> dict | None:
+    """
+    Obtiene contenido del portapapeles.
+    Prioridad: imagen -> texto
+    Compatible con Wayland y X11.
+    """
+
+    # Intentar imagen (Wayland)
     try:
         result = subprocess.run(
             ["wl-paste", "--type", "image/png"],
@@ -48,10 +68,11 @@ def get_clipboard():
             stderr=subprocess.DEVNULL
         )
         if result.stdout:
-              return {"type": "image", "data": result.stdout}
-    except:
+            return {"type": "image", "data": result.stdout}
+    except Exception:
         pass
 
+    # Intentar imagen (X11)
     try:
         result = subprocess.run(
             ["xclip", "-selection", "clipboard", "-t", "image/png", "-o"],
@@ -60,10 +81,10 @@ def get_clipboard():
         )
         if result.stdout:
             return {"type": "image", "data": result.stdout}
-    except:
+    except Exception:
         pass
 
-    # Texto
+    # Texto (Wayland)
     try:
         result = subprocess.run(
             ["wl-paste", "--no-newline"],
@@ -73,9 +94,10 @@ def get_clipboard():
         text = result.stdout.decode().strip()
         if text:
             return {"type": "text", "data": text}
-    except:
+    except Exception:
         pass
 
+    # Texto (X11)
     try:
         result = subprocess.run(
             ["xclip", "-selection", "clipboard", "-o"],
@@ -85,13 +107,16 @@ def get_clipboard():
         text = result.stdout.decode().strip()
         if text:
             return {"type": "text", "data": text}
-    except:
+    except Exception:
         pass
 
     return None
 
-def set_clipboard(text):
-    # WAYLAND
+
+def set_clipboard_text(text: str):
+    """
+    Copia texto al portapapeles.
+    """
     if IS_WAYLAND:
         try:
             subprocess.run(
@@ -100,55 +125,81 @@ def set_clipboard(text):
                 stderr=subprocess.DEVNULL
             )
             return
-        except:
+        except Exception:
             pass
 
-    # X11
     subprocess.run(
         ["xclip", "-selection", "clipboard"],
         input=text.encode(),
         stderr=subprocess.DEVNULL
     )
 
+
+def set_clipboard_image(data: bytes):
+    """
+    Copia imagen al portapapeles.
+    """
+    try:
+        subprocess.run(
+            ["wl-copy"],
+            input=data,
+            stderr=subprocess.DEVNULL
+        )
+    except Exception:
+        subprocess.run(
+            ["xclip", "-selection", "clipboard", "-t", "image/png"],
+            input=data,
+            stderr=subprocess.DEVNULL
+        )
+
+
 def paste():
+    """
+    Simula Ctrl+V.
+    """
     kb.press(Key.ctrl)
     kb.press('v')
     kb.release('v')
     kb.release(Key.ctrl)
 
-# 
-# MONITOR
-# 
+
+# =========================
+# MONITOR DE CLIPBOARD
+# =========================
 def monitor_clipboard():
-    global last
+    global last_hash
+
     while True:
         current = get_clipboard()
 
-        if current is None:
-            time.sleep(0.5)
+        if not current:
+            time.sleep(POLL_INTERVAL)
             continue
 
-        current_hash = get_hash(current)
+        current_hash = compute_hash(current)
 
         with lock:
-            if current_hash != last:
+            if current_hash != last_hash:
                 history.insert(0, current)
 
                 if len(history) > MAX_ITEMS:
                     history.pop()
 
-                last = current_hash
+                last_hash = current_hash
 
-        time.sleep(0.5)
+        time.sleep(POLL_INTERVAL)
 
-# 
+
+# =========================
 # UI
-# 
+# =========================
 class Popup(QWidget):
     def __init__(self):
         super().__init__()
+        self._setup_ui()
 
-        self.setWindowTitle("Clipboard")
+    def _setup_ui(self):
+        self.setWindowTitle("LClipboard")
         self.setFixedSize(400, 400)
 
         self.setWindowFlags(
@@ -173,7 +224,8 @@ class Popup(QWidget):
             }
             QLineEdit {
                 background-color: #161b22;
-                padding: 5px;
+                padding: 6px;
+                border: none;
             }
             QListWidget::item {
                 padding: 8px;
@@ -188,121 +240,113 @@ class Popup(QWidget):
         layout.addWidget(self.list_widget)
         self.setLayout(layout)
 
-    # 
-    # REFRESH
-    # 
+    # =========================
+    # RENDER
+    # =========================
     def refresh(self):
-      self.list_widget.clear()
+        self.list_widget.clear()
 
-      with lock:
-          for item in history:
-              list_item = QListWidgetItem()
+        with lock:
+            for item in history:
+                list_item = self._create_list_item(item)
+                self.list_widget.addItem(list_item)
 
-              if item["type"] == "text":
-                  list_item.setText(item["data"][:80])
+        if self.list_widget.count() > 0:
+            self.list_widget.setCurrentRow(0)
 
-              elif item["type"] == "image":
-                  pixmap = QPixmap()
-                  pixmap.loadFromData(QByteArray(item["data"]))
-                  icon = QIcon(
-                      pixmap.scaled(
-                          64, 64,
-                          Qt.AspectRatioMode.KeepAspectRatio,
-                          Qt.TransformationMode.SmoothTransformation
-                      )
-                  )
+    def _create_list_item(self, item: dict) -> QListWidgetItem:
+        list_item = QListWidgetItem()
 
-                  list_item.setIcon(icon)
-                  list_item.setSizeHint(list_item.sizeHint() * 1.5)
+        if item["type"] == "text":
+            list_item.setText(item["data"][:80])
 
-                  list_item.setText("[Image]")
+        elif item["type"] == "image":
+            pixmap = QPixmap()
+            pixmap.loadFromData(QByteArray(item["data"]))
 
-              list_item.setData(Qt.ItemDataRole.UserRole, item)
-              self.list_widget.addItem(list_item)
+            if not pixmap.isNull():
+                icon = QIcon(
+                    pixmap.scaled(
+                        64, 64,
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation
+                    )
+                )
+                list_item.setIcon(icon)
 
-      if self.list_widget.count() > 0:
-          self.list_widget.setCurrentRow(0)
+            list_item.setText("[Image]")
+            list_item.setSizeHint(list_item.sizeHint() * 1.5)
 
-    # 
-    # FILTER
-    # 
+        list_item.setData(Qt.ItemDataRole.UserRole, item)
+        return list_item
+
+    # =========================
+    # FILTRO
+    # =========================
     def filter_items(self):
-      text = self.search.text().lower()
-      self.list_widget.clear()
+        query = self.search.text().lower()
+        self.list_widget.clear()
 
-      with lock:
-          for item in history:
-              if item["type"] == "text" and text in item["data"].lower():
-                  list_item = QListWidgetItem(item["data"][:80])
-                  list_item.setData(Qt.ItemDataRole.UserRole, item)
-                  self.list_widget.addItem(list_item)
+        with lock:
+            for item in history:
+                if item["type"] == "text" and query in item["data"].lower():
+                    list_item = QListWidgetItem(item["data"][:80])
+                    list_item.setData(Qt.ItemDataRole.UserRole, item)
+                    self.list_widget.addItem(list_item)
 
-    # 
-    # COPY + PASTE
-    # 
-    def copy_item(self, item):
-      data = item.data(Qt.ItemDataRole.UserRole)
+    # =========================
+    # ACCIONES
+    # =========================
+    def copy_item(self, item: QListWidgetItem):
+        data = item.data(Qt.ItemDataRole.UserRole)
 
-      if data["type"] == "text":
-          set_clipboard(data["data"])
+        if data["type"] == "text":
+            set_clipboard_text(data["data"])
+        else:
+            set_clipboard_image(data["data"])
 
-      elif data["type"] == "image":
-          try:
-              subprocess.run(
-                  ["wl-copy"],
-                  input=data["data"],
-                  stderr=subprocess.DEVNULL
-              )
-          except:
-              subprocess.run(
-                  ["xclip", "-selection", "clipboard", "-t", "image/png"],
-                  input=data["data"],
-                  stderr=subprocess.DEVNULL
-              )
+        self.hide()
+        QTimer.singleShot(50, paste)
 
-      self.hide()
-      QTimer.singleShot(50, paste)
-
-    # 
-    # CERRAR AL PERDER FOCO
-    # 
+    # =========================
+    # EVENTOS
+    # =========================
     def focusOutEvent(self, event):
         self.hide()
 
-    # 
-    # TECLADO
-    # 
     def keyPressEvent(self, event):
-        if event.key() == Qt.Key.Key_Escape:
+        key = event.key()
+
+        if key == Qt.Key.Key_Escape:
             self.hide()
 
-        elif event.key() == Qt.Key.Key_Return:
+        elif key == Qt.Key.Key_Return:
             item = self.list_widget.currentItem()
             if item:
                 self.copy_item(item)
 
-        elif event.key() == Qt.Key.Key_Down:
-            row = self.list_widget.currentRow()
-            self.list_widget.setCurrentRow(row + 1)
+        elif key == Qt.Key.Key_Down:
+            self.list_widget.setCurrentRow(self.list_widget.currentRow() + 1)
 
-        elif event.key() == Qt.Key.Key_Up:
-            row = self.list_widget.currentRow()
-            self.list_widget.setCurrentRow(row - 1)
+        elif key == Qt.Key.Key_Up:
+            self.list_widget.setCurrentRow(self.list_widget.currentRow() - 1)
 
-# 
+
+# =========================
 # HOTKEY
-# 
+# =========================
 popup = None
+
 
 def on_activate():
     popup.refresh()
     popup.search.clear()
 
     popup.move(QCursor.pos())
-
     popup.show()
     popup.activateWindow()
     popup.search.setFocus()
+
 
 def listen_hotkey():
     with keyboard.GlobalHotKeys({
@@ -310,14 +354,21 @@ def listen_hotkey():
     }) as h:
         h.join()
 
-# 
+
+# =========================
 # MAIN
-# 
-app = QApplication(sys.argv)
-popup = Popup()
+# =========================
+def main():
+    global popup
 
-threading.Thread(target=monitor_clipboard, daemon=True).start()
-threading.Thread(target=listen_hotkey, daemon=True).start()
+    app = QApplication(sys.argv)
+    popup = Popup()
 
-sys.exit(app.exec())
+    threading.Thread(target=monitor_clipboard, daemon=True).start()
+    threading.Thread(target=listen_hotkey, daemon=True).start()
 
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
